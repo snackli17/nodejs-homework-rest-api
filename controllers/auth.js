@@ -1,9 +1,16 @@
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const gravatar = require("gravatar");
+const path = require("path");
+const fs = require("fs/promises");
+const Jimp = require("jimp");
+const { nanoid } = require("nanoid");
 
-const { SECRET_KEY } = process.env;
-const { HttpError, ctrlWrapper } = require("../helpers");
+const { SECRET_KEY, BASE_URL } = process.env;
+const { HttpError, ctrlWrapper, sendEmail } = require("../helpers");
 const { User } = require("../models/user");
+
+const avatarDir = path.join(__dirname, "../", "public", "avatars");
 
 const register = async (req, res) => {
     const { email, password, subscription } = req.body;
@@ -12,17 +19,56 @@ const register = async (req, res) => {
         throw HttpError(409, "Email in use");
     }
     const hashPassword = await bcrypt.hash(password, 10);
+    const avatarURL = gravatar.url(email);
+    const verificationToken = nanoid();
     const result = await User.create({
         email,
         password: hashPassword,
         subscription,
+        avatarURL,
+        verificationToken,
     });
+    const verifyEmail = {
+        to: email,
+        subject: "Verify email",
+        html: `<a target="_blank" href="${BASE_URL}/api/auth/verify/${verificationToken}">Click verify email</a>`,
+    };
+    await sendEmail(verifyEmail);
     res.status(201).json({
         user: {
             email: result.email,
             subscription: result.subscription,
+            avatarURL: result.avatarURL,
         },
     });
+};
+
+const verify = async (req, res) => {
+    const { verificationToken } = req.params;
+    const user = await User.findOne({ verificationToken });
+    if (!user) {
+        throw HttpError(404, "User not found");
+    }
+    await User.findByIdAndUpdate(user._id, { verify: true, verificationToken: null });
+    res.json({ message: "Verification successful" });
+};
+
+const resendVerifyEmail = async (req, res) => {
+    const { email } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) {
+        throw HttpError(400, "Missing required field email");
+    }
+    if (user.verify) {
+        throw HttpError(400, "Verification has already been passed");
+    }
+    const verifyEmail = {
+        to: email,
+        subject: "Verify email",
+        html: `<a target="_blank" href="${BASE_URL}/api/auth/verify/${user.verificationToken}">Click verify email</a>`,
+    };
+    await sendEmail(verifyEmail);
+    res.json({ message: "Verification email sent" });
 };
 
 const login = async (req, res) => {
@@ -30,6 +76,9 @@ const login = async (req, res) => {
     const user = await User.findOne({ email });
     if (!user) {
         throw HttpError(401, "Email or password is wrong");
+    }
+    if (!user.verify) {
+        throw HttpError(401, "Email not verify");
     }
     const passwordCompare = await bcrypt.compare(password, user.password);
     if (!passwordCompare) {
@@ -44,6 +93,29 @@ const login = async (req, res) => {
             email: user.email,
             subscription: user.subscription,
         },
+    });
+};
+
+const updateAvatar = async (req, res) => {
+    if (!req.file) {
+        throw HttpError("400", "Avatar must be exist");
+    };
+    const { path: tempUpload, originalname } = req.file;
+    const { _id } = req.user;
+    const filename = `${_id}_${originalname}`;
+    const resultUpload = path.join(avatarDir, filename);
+    const avatarURL = path.join("avatars", filename);
+    await Jimp.read(tempUpload)
+        .then((avatar) => {
+            return avatar.resize(250, 250).write(tempUpload);
+        })
+        .catch((error) => {
+            throw error;
+        });
+    await fs.rename(tempUpload, resultUpload);
+    await User.findByIdAndUpdate(_id, { avatarURL });
+    res.json({
+        avatarURL,
     });
 };
 
@@ -62,7 +134,10 @@ const logout = async (req, res) => {
 
 module.exports = {
     register: ctrlWrapper(register),
+    verify: ctrlWrapper(verify),
+    resendVerifyEmail: ctrlWrapper(resendVerifyEmail),
     login: ctrlWrapper(login),
     getCurrent: ctrlWrapper(getCurrent),
     logout: ctrlWrapper(logout),
+    updateAvatar: ctrlWrapper(updateAvatar),
 };
